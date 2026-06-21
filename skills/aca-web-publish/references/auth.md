@@ -34,6 +34,20 @@ ENTRA_CLIENT_ID=<id>
 ENTRA_CLIENT_SECRET=<secret>
 ```
 
+## Hostname timing
+
+OAuth registration must use the final browser-visible URL. Do not collect OAuth app credentials until that URL is known.
+
+With custom DNS, collect the hostname and DNS zone first, then instruct the user to create the OAuth app with that hostname.
+
+With the ACA built-in hostname, create a bootstrap ACA endpoint first and read its FQDN:
+
+```powershell
+az containerapp show --name <app> --resource-group <rg> --query properties.configuration.ingress.fqdn -o tsv
+```
+
+Then use `https://<fqdn>` as the homepage/origin and `https://<fqdn>/oauth/<provider>/callback` as the callback URL.
+
 ## GitHub registration
 
 Create a GitHub OAuth App manually in GitHub Developer settings:

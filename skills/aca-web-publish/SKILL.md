@@ -29,7 +29,12 @@ Unless the user has already provided all choices explicitly, use the `ask_user` 
 | Content directory | Ask for local path |
 | Azure resource names | Generate safe defaults, but ask before changing existing infra |
 
-Before asking for any OAuth client ID or secret, first give the user the provider portal link and exact redirect URLs based on the chosen hostname. Collect client IDs/secrets with `ask_user`; never echo secrets in the final response and never commit them.
+Before asking for any OAuth client ID or secret, first determine whether the final public hostname is already known:
+
+- With custom DNS, ask for the hostname and DNS zone first. Then give the user the provider portal link and exact redirect URLs for that custom hostname before collecting client IDs/secrets.
+- With the ACA built-in hostname, do not ask for OAuth client IDs/secrets yet because the hostname is not known until ACA exists. First create a bootstrap ACA endpoint, capture its `https://<app>.<region>.azurecontainerapps.io` URL, then give the user the provider portal link and exact redirect URLs and collect client IDs/secrets.
+
+Never ask the user to create an OAuth app from placeholder URLs. Collect client IDs/secrets with `ask_user`; never echo secrets in the final response and never commit them.
 
 ## Key defaults
 
@@ -60,6 +65,24 @@ For ACR, avoid creating ACA directly from the private image before `AcrPull` is 
 
 When building with `az acr build` from Windows terminals, use `--no-logs` to avoid Azure CLI log streaming Unicode/console encoding failures; query the build result instead.
 
+## OAuth hostname timing
+
+OAuth app registration must use the final browser-visible host in the homepage/origin and callback URL.
+
+### Custom DNS flow
+
+1. Ask for the custom hostname and DNS zone.
+2. Show the provider registration link and exact URLs, for example `https://site.example.com` and `https://site.example.com/oauth/github/callback`.
+3. Collect the client ID and secret.
+4. Deploy ACA, DNS, auth settings, content, and certificate binding.
+
+### ACA built-in hostname flow
+
+1. Deploy a bootstrap ACA endpoint first to discover the built-in hostname. Use the deployment script with `-BootstrapOnly` or create the ACA/container app shell manually.
+2. Show the provider registration link and exact URLs using the discovered hostname, for example `https://<fqdn>` and `https://<fqdn>/oauth/github/callback`.
+3. Collect the client ID and secret.
+4. Complete the deployment by applying auth settings, uploading content, and switching to the proxy image if the app was bootstrapped.
+
 ## Required files to copy or adapt
 
 Use these assets as implementation starting points:
@@ -79,16 +102,17 @@ Read these references when needed:
 ## Implementation checklist
 
 1. Confirm content directory and generated site entry point.
-2. Choose auth provider and give the user provider-specific app registration links and exact callback URLs.
-3. Collect app registration values.
-4. Collect allowed users.
-5. Choose GHCR or ACR.
-6. Choose custom DNS or ACA built-in hostname.
-7. Copy/adapt the sample app and Dockerfile into the target repository.
-8. If GHCR mode, add the workflow and make the resulting package public.
-9. Deploy ACA, private Blob Storage, RBAC, secrets, env vars, and optional DNS.
-10. Upload content to Blob and set Cold tier.
-11. Smoke test:
+2. Choose custom DNS or ACA built-in hostname.
+3. Choose auth provider.
+4. If the hostname is known, give the user provider-specific app registration links and exact callback URLs; if using the ACA built-in hostname, bootstrap ACA first and then provide those URLs.
+5. Collect app registration values.
+6. Collect allowed users.
+7. Choose GHCR or ACR.
+8. Copy/adapt the sample app and Dockerfile into the target repository.
+9. If GHCR mode, add the workflow and make the resulting package public.
+10. Deploy ACA, private Blob Storage, RBAC, secrets, env vars, and optional DNS.
+11. Upload content to Blob and set Cold tier.
+12. Smoke test:
     - unauthenticated request redirects to provider, unless `AUTH_PROVIDER=none`;
     - allowed user can load `index.html`;
     - non-allowed user gets `403`;

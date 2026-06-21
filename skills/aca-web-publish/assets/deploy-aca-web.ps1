@@ -27,7 +27,8 @@ param(
     [string]$EntraClientSecret = $env:ENTRA_CLIENT_SECRET,
     [ValidateSet("auto", "azcopy", "cli")]
     [string]$UploadMode = "auto",
-    [switch]$InstallAzCopy
+    [switch]$InstallAzCopy,
+    [switch]$BootstrapOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -64,8 +65,17 @@ function Install-AzCopyIfRequested {
 if (-not $ResourceGroup -or -not $AppName -or -not $EnvironmentName -or -not $StorageAccountName -or -not $ContentDir) {
     throw "ResourceGroup, AppName, EnvironmentName, StorageAccountName, and ContentDir are required."
 }
-if ($AuthProvider -ne "none" -and -not $AllowedUsers) {
+if (-not $BootstrapOnly -and $AuthProvider -ne "none" -and -not $AllowedUsers) {
     throw "AllowedUsers is required for authenticated deployments. Empty allowlists deny everyone."
+}
+if (-not $BootstrapOnly -and $AuthProvider -eq "github" -and (-not $GitHubClientId -or -not $GitHubClientSecret)) {
+    throw "GitHubClientId and GitHubClientSecret are required when AuthProvider=github."
+}
+if (-not $BootstrapOnly -and $AuthProvider -eq "google" -and (-not $GoogleClientId -or -not $GoogleClientSecret)) {
+    throw "GoogleClientId and GoogleClientSecret are required when AuthProvider=google."
+}
+if (-not $BootstrapOnly -and $AuthProvider -eq "entra" -and (-not $EntraTenantId -or -not $EntraClientId -or -not $EntraClientSecret)) {
+    throw "EntraTenantId, EntraClientId, and EntraClientSecret are required when AuthProvider=entra."
 }
 if (-not $SessionSecret) {
     $bytes = [byte[]]::new(32)
@@ -120,19 +130,22 @@ az containerapp env create --name $EnvironmentName --resource-group $ResourceGro
 
 $initialImage = if ($registryId) { "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest" } else { $Image }
 $initialTargetPort = if ($registryId) { 80 } else { 8000 }
-az containerapp create `
-    --name $AppName `
-    --resource-group $ResourceGroup `
-    --environment $EnvironmentName `
-    --image $initialImage `
-    --ingress external `
-    --target-port $initialTargetPort `
-    --min-replicas 0 `
-    --max-replicas 2 `
-    --cpu 0.25 `
-    --memory 0.5Gi `
-    --system-assigned `
-    --output none 2>$null
+$existingApp = az containerapp show --name $AppName --resource-group $ResourceGroup --query name -o tsv 2>$null
+if (-not $existingApp) {
+    az containerapp create `
+        --name $AppName `
+        --resource-group $ResourceGroup `
+        --environment $EnvironmentName `
+        --image $initialImage `
+        --ingress external `
+        --target-port $initialTargetPort `
+        --min-replicas 0 `
+        --max-replicas 2 `
+        --cpu 0.25 `
+        --memory 0.5Gi `
+        --system-assigned `
+        --output none
+}
 
 $principalId = az containerapp show --name $AppName --resource-group $ResourceGroup --query identity.principalId -o tsv
 az role assignment create --assignee $principalId --role "Storage Blob Data Reader" --scope $storageId --output none 2>$null
@@ -145,6 +158,12 @@ if ($registryId) {
 $fqdn = az containerapp show --name $AppName --resource-group $ResourceGroup --query properties.configuration.ingress.fqdn -o tsv
 if (-not $PublicBaseUrl) {
     $PublicBaseUrl = if ($CustomHostname) { "https://$CustomHostname" } else { "https://$fqdn" }
+}
+if ($BootstrapOnly) {
+    Write-Host "BOOTSTRAP DONE"
+    Write-Host "URL: $PublicBaseUrl"
+    Write-Host "Use this URL for OAuth app registration, then rerun without -BootstrapOnly and provide the provider client ID/secret."
+    return
 }
 
 $secrets = @("session-secret=$SessionSecret")
