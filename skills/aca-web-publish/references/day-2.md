@@ -32,6 +32,15 @@ azcopy set-properties https://<storage>.blob.core.windows.net/<container> --bloc
 
 Use `--delete-destination=true` only when the local directory is authoritative.
 
+If AzCopy is missing, install it before large uploads or use the deploy script with `-InstallAzCopy`. For small sites, Azure CLI can be used as a fallback:
+
+```powershell
+az storage blob delete-batch --account-name <storage> --source <container> --auth-mode login
+az storage blob upload-batch --account-name <storage> --destination <container> --source <content-dir> --auth-mode login --overwrite true --tier Cold
+```
+
+Prefer AzCopy for large sites because it handles high file counts and incremental sync more efficiently.
+
 ## Rotate OAuth secrets
 
 1. Create a new provider secret in the provider portal.
@@ -52,4 +61,3 @@ If logs show Blob `AuthorizationFailure`, check:
 ## Direct blob access check
 
 Anonymous direct Blob URLs should fail. Content should only be reachable through ACA.
-

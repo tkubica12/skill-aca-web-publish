@@ -42,6 +42,11 @@ def _public_base_url(request: Request) -> str:
     return os.getenv("PUBLIC_BASE_URL", str(request.base_url).rstrip("/")).rstrip("/")
 
 
+def _public_request_url(request: Request) -> str:
+    url = f"{_public_base_url(request)}{request.url.path}"
+    return f"{url}?{request.url.query}" if request.url.query else url
+
+
 def _required_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
@@ -145,7 +150,7 @@ def _start_oauth(request: Request) -> RedirectResponse:
     else:
         raise HTTPException(status_code=500, detail=f"Unsupported AUTH_PROVIDER: {provider}")
     response = RedirectResponse(location, status_code=302)
-    response.set_cookie(_STATE_COOKIE, _state_cookie(str(request.url), state), httponly=True, secure=True, samesite="lax", max_age=600)
+    response.set_cookie(_STATE_COOKIE, _state_cookie(_public_request_url(request), state), httponly=True, secure=True, samesite="lax", max_age=600)
     return response
 
 
@@ -352,4 +357,3 @@ def serve_blob(request: Request, path: str, range_header: str | None = Header(de
     if request.method == "HEAD":
         return Response(headers=headers, media_type=content_type)
     return StreamingResponse(_blob_chunks(container, blob_name, 0, size), headers=headers, media_type=content_type)
-

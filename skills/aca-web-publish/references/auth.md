@@ -36,7 +36,13 @@ ENTRA_CLIENT_SECRET=<secret>
 
 ## GitHub registration
 
-Create a GitHub OAuth App manually in GitHub Developer settings.
+Create a GitHub OAuth App manually in GitHub Developer settings:
+
+```text
+https://github.com/settings/developers
+```
+
+Click **OAuth Apps** > **New OAuth App** before collecting the client ID or secret from the user.
 
 Use:
 
@@ -55,7 +61,11 @@ Authorize using GitHub handles in `ALLOWED_USERS`. Use `GITHUB_ALLOWED_EMAILS` o
 
 ## Google registration
 
-Create an OAuth client in Google Cloud Console:
+Create an OAuth client in Google Cloud Console before collecting the client ID or secret:
+
+```text
+https://console.cloud.google.com/apis/credentials
+```
 
 ```text
 Application type: Web application
@@ -67,7 +77,11 @@ Authorize using email addresses in `ALLOWED_USERS`.
 
 ## Entra registration
 
-Create an app registration in Microsoft Entra:
+Create an app registration in Microsoft Entra before collecting the client ID or secret:
+
+```text
+https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade
+```
 
 ```text
 Platform: Web
@@ -88,4 +102,3 @@ Authorize using object IDs where possible. UPN/email can be allowed for convenie
 ## No auth
 
 Use `AUTH_PROVIDER=none` only when the user explicitly requests no authentication. Blob Storage should still remain private; ACA becomes the public serving endpoint.
-

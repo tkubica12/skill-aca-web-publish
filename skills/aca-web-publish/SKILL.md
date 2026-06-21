@@ -29,7 +29,7 @@ Unless the user has already provided all choices explicitly, use the `ask_user` 
 | Content directory | Ask for local path |
 | Azure resource names | Generate safe defaults, but ask before changing existing infra |
 
-Explain registration requirements before asking for client secrets. Collect client IDs/secrets with `ask_user`; never echo secrets in the final response and never commit them.
+Before asking for any OAuth client ID or secret, first give the user the provider portal link and exact redirect URLs based on the chosen hostname. Collect client IDs/secrets with `ask_user`; never echo secrets in the final response and never commit them.
 
 ## Key defaults
 
@@ -56,6 +56,10 @@ Use GHCR when the image contains only proxy/auth code and no content. The image/
 
 Use ACR when the user wants a fully private and self-contained Azure solution. Create an ACR, build or push the image there, and grant the ACA managed identity `AcrPull`.
 
+For ACR, avoid creating ACA directly from the private image before `AcrPull` is configured. Create the app first with a public bootstrap image and system-assigned identity, grant that identity `AcrPull`, configure the registry with `--identity system`, then update the app to the ACR image.
+
+When building with `az acr build` from Windows terminals, use `--no-logs` to avoid Azure CLI log streaming Unicode/console encoding failures; query the build result instead.
+
 ## Required files to copy or adapt
 
 Use these assets as implementation starting points:
@@ -75,15 +79,16 @@ Read these references when needed:
 ## Implementation checklist
 
 1. Confirm content directory and generated site entry point.
-2. Choose auth provider and collect app registration values.
-3. Collect allowed users.
-4. Choose GHCR or ACR.
-5. Choose custom DNS or ACA built-in hostname.
-6. Copy/adapt the sample app and Dockerfile into the target repository.
-7. If GHCR mode, add the workflow and make the resulting package public.
-8. Deploy ACA, private Blob Storage, RBAC, secrets, env vars, and optional DNS.
-9. Upload content to Blob and set Cold tier.
-10. Smoke test:
+2. Choose auth provider and give the user provider-specific app registration links and exact callback URLs.
+3. Collect app registration values.
+4. Collect allowed users.
+5. Choose GHCR or ACR.
+6. Choose custom DNS or ACA built-in hostname.
+7. Copy/adapt the sample app and Dockerfile into the target repository.
+8. If GHCR mode, add the workflow and make the resulting package public.
+9. Deploy ACA, private Blob Storage, RBAC, secrets, env vars, and optional DNS.
+10. Upload content to Blob and set Cold tier.
+11. Smoke test:
     - unauthenticated request redirects to provider, unless `AUTH_PROVIDER=none`;
     - allowed user can load `index.html`;
     - non-allowed user gets `403`;
@@ -96,7 +101,8 @@ For "add user", update only `ALLOWED_USERS` or provider-specific allowlist env v
 
 For "upload new content", regenerate local static output, run Blob sync with delete enabled only if local output is authoritative, then set Cold tier.
 
+Prefer AzCopy for large sites or many files. If AzCopy is unavailable and the site is small, Azure CLI `az storage blob upload-batch --auth-mode login` is an acceptable fallback; for large sites, install AzCopy first or use the deploy script with `-InstallAzCopy`.
+
 For "switch auth provider", create the new provider registration first, set secrets/env vars, verify login, then remove obsolete provider secrets.
 
 For "move from GHCR to ACR", deploy ACR, grant `AcrPull`, update the image reference, and keep Blob content unchanged.
-
