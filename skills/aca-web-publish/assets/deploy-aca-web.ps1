@@ -28,7 +28,8 @@ param(
     [ValidateSet("auto", "azcopy", "cli")]
     [string]$UploadMode = "auto",
     [switch]$InstallAzCopy,
-    [switch]$BootstrapOnly
+    [switch]$BootstrapOnly,
+    [switch]$SkipStorageNetworkPolicyExemption
 )
 
 $ErrorActionPreference = "Stop"
@@ -112,6 +113,27 @@ az storage container-rm create `
     --output none
 
 $storageId = az storage account show --name $StorageAccountName --resource-group $ResourceGroup --query id -o tsv
+
+if (-not $SkipStorageNetworkPolicyExemption) {
+    $subscriptionId = az account show --query id -o tsv
+    $securityCenterAssignment = "/subscriptions/$subscriptionId/providers/Microsoft.Authorization/policyAssignments/SecurityCenterBuiltIn"
+    az policy exemption show --name "aca-web-proxy-storage-network" --scope $storageId --output none 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        az policy exemption create `
+            --name "aca-web-proxy-storage-network" `
+            --scope $storageId `
+            --policy-assignment $securityCenterAssignment `
+            --exemption-category Waiver `
+            --display-name "ACA web proxy storage network exception" `
+            --description "Private content is served only through ACA app-level auth proxy. Blob public access and shared keys are disabled; ACA managed identity uses Storage Blob Data Reader. Public network access is required unless ACA is moved to VNet private endpoint." `
+            --policy-definition-reference-ids `
+                "storageAccountsShouldRestrictNetworkAccessUsingVirtualNetworkRulesMonitoringEffect" `
+                "storageAccountsShouldRestrictNetworkAccessUsingVirtualNetworkRulesExDataBricksMonitoringEffect" `
+                "storageAccountShouldUseAPrivateLinkConnectionMonitoringEffect" `
+                "storageAccountShouldUseAPrivateLinkConnectionExDataBricksMonitoringEffect" `
+            --output none
+    }
+}
 
 if ($RegistryMode -eq "acr") {
     if (-not $AcrName) {

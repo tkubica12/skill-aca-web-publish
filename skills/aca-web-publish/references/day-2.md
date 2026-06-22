@@ -58,6 +58,18 @@ If logs show Blob `AuthorizationFailure`, check:
 - Blob public access is disabled.
 - Shared keys are disabled.
 
+If `publicNetworkAccess` was enabled and later changed to disabled, inspect the activity log:
+
+```powershell
+$storageId = az storage account show --name <storage> --resource-group <rg> --query id -o tsv
+az monitor activity-log list --resource-id $storageId --offset 24h -o table
+```
+
+If a Microsoft first-party app or Defender/Security Center policy patched it, either:
+
+1. Create a targeted policy exemption for this storage account, keeping blob public access and shared keys disabled.
+2. Or move ACA to a VNet-integrated environment with a Blob private endpoint and keep `publicNetworkAccess=Disabled`.
+
 ## Direct blob access check
 
 Anonymous direct Blob URLs should fail. Content should only be reachable through ACA.
