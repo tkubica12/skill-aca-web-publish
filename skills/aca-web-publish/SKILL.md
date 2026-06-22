@@ -7,14 +7,17 @@ compatibility: Requires Azure CLI, gh CLI for GitHub operations, Azure subscript
 
 # ACA Web Publish
 
-Use this skill to deploy private static content on Azure without exposing Blob Storage publicly. The default pattern is:
+Use this skill to deploy private static content on Azure without exposing Blob Storage publicly. The default pattern is policy-aligned private networking:
 
 1. Static content is uploaded to private Azure Blob Storage and set to Cold tier.
 2. A small Docker image runs in Azure Container Apps (ACA).
 3. The container implements app-level authentication and streams Blob content through ACA.
-4. ACA uses a system-assigned managed identity with `Storage Blob Data Reader`.
-5. Browser users never receive blob keys, SAS URLs, direct blob URLs, or storage account keys.
-6. ACA Easy Auth is not used.
+4. ACA runs in a VNet-integrated Workload Profiles environment with the Consumption workload profile.
+5. Blob Storage is reached through a Blob private endpoint and `privatelink.blob.core.windows.net` private DNS.
+6. Storage final state is `publicNetworkAccess=Disabled`, firewall default action `Deny`, `allowBlobPublicAccess=false`, and `allowSharedKeyAccess=false`.
+7. ACA uses a system-assigned managed identity with `Storage Blob Data Reader`.
+8. Browser users never receive blob keys, SAS URLs, direct blob URLs, or storage account keys.
+9. ACA Easy Auth is not used; authentication stays in the app.
 
 ## Mandatory interaction model
 
@@ -28,6 +31,11 @@ Unless the user has already provided all choices explicitly, use the `ask_user` 
 | Custom DNS | Prefer custom DNS if the user has an Azure DNS zone |
 | Content directory | Ask for local path |
 | Azure resource names | Generate safe defaults, but ask before changing existing infra |
+| Storage networking | Private endpoint, not public RBAC |
+| VNet CIDR | `10.42.0.0/24` |
+| ACA subnet | `snet-aca-env`, `/27`, delegated to `Microsoft.App/environments` |
+| Private endpoint subnet | `snet-storage-pe`, `/28` |
+| Upload path | Temporary narrow public upload window by default; VNet-hosted runner for stricter environments |
 
 Before asking for any OAuth client ID or secret, first determine whether the final public hostname is already known:
 
@@ -47,9 +55,12 @@ Never ask the user to create an OAuth app from placeholder URLs. Collect client 
   - Google: email addresses.
   - Entra: object IDs or UPN/email addresses, depending on implementation.
 - Optional email allowlists may be used for GitHub as defense-in-depth, but handles are the primary GitHub identity.
-- Storage account must keep `publicNetworkAccess=Enabled` unless ACA has a VNet/private endpoint route to Blob. Keep `allowBlobPublicAccess=false` and `allowSharedKeyAccess=false`.
+- Storage networking defaults to `private-endpoint`. The old public endpoint + RBAC pattern is `public-rbac` fallback only.
+- Storage final state for the default pattern must be `publicNetworkAccess=Disabled`, firewall default action `Deny`, `bypass=None`, `allowBlobPublicAccess=false`, and `allowSharedKeyAccess=false`.
+- Use a Workload Profiles Container Apps environment with VNet infrastructure subnet and the Consumption workload profile. Do not use Flex as the default.
 - ACA should be small: start at `0.25` CPU and `0.5Gi` memory.
 - ACA should scale to zero with a 60-minute cooldown/idleness behavior where supported by the active ACA/KEDA CLI surface; otherwise use min replicas `0` and document the limitation.
+- Existing non-VNet ACA environments should be treated as effectively immutable for VNet attachment. Migrate by creating a new VNet-integrated environment, deploying a replacement app, and cutting over the custom domain.
 
 ## Registry choices
 
@@ -64,6 +75,46 @@ Use ACR when the user wants a fully private and self-contained Azure solution. C
 For ACR, avoid creating ACA directly from the private image before `AcrPull` is configured. Create the app first with a public bootstrap image and system-assigned identity, grant that identity `AcrPull`, configure the registry with `--identity system`, then update the app to the ACR image.
 
 When building with `az acr build` from Windows terminals, use `--no-logs` to avoid Azure CLI log streaming Unicode/console encoding failures; query the build result instead.
+
+## Storage networking choices
+
+### Default: private endpoint
+
+Create VNet resources before locking Storage:
+
+1. VNet, default `/24`.
+2. ACA infrastructure subnet, minimum `/27`, delegated to `Microsoft.App/environments`.
+3. Private endpoint subnet, default `/28`.
+4. Private DNS zone `privatelink.blob.core.windows.net`.
+5. VNet link for the private DNS zone.
+6. Blob private endpoint for the Storage account target subresource `blob`.
+7. Private DNS zone group on the private endpoint.
+8. ACA Workload Profiles environment with `--enable-workload-profiles true` and `--infrastructure-subnet-resource-id`.
+9. ACA proxy app in that environment with system-assigned identity.
+10. `Storage Blob Data Reader` RBAC for the ACA identity.
+11. Content upload.
+12. Storage lock-down to `publicNetworkAccess=Disabled`, `defaultAction=Deny`, `bypass=None`.
+
+Do not disable Storage public network access before the private endpoint and DNS path exist.
+
+### Fallback: public RBAC
+
+Use `public-rbac` only when private endpoints are intentionally out of scope. Blobs still must not be anonymous and shared keys still must stay disabled. Do not use policy exemptions as the normal path.
+
+### Upload strategy
+
+For the default private endpoint pattern, local uploads need either a VNet path or a temporary authenticated public network window. The pragmatic default is a narrow temporary window:
+
+1. Enable Storage public network access.
+2. Keep `allowBlobPublicAccess=false`.
+3. Keep `allowSharedKeyAccess=false`.
+4. Set firewall default action `Deny`.
+5. Add only the current uploader public IP as a network rule.
+6. Upload with Entra/RBAC using AzCopy when available.
+7. Remove the IP rule in `finally`.
+8. Disable Storage public network access again and keep default action `Deny`.
+
+For stricter environments, use a VNet-hosted upload runner: a temporary VM/jumpbox, self-hosted runner, VPN/ExpressRoute client path, or temporary ACA Job in the VNet.
 
 ## OAuth hostname timing
 
@@ -102,28 +153,33 @@ Read these references when needed:
 ## Implementation checklist
 
 1. Confirm content directory and generated site entry point.
-2. Choose custom DNS or ACA built-in hostname.
-3. Choose auth provider.
-4. If the hostname is known, give the user provider-specific app registration links and exact callback URLs; if using the ACA built-in hostname, bootstrap ACA first and then provide those URLs.
-5. Collect app registration values.
-6. Collect allowed users.
-7. Choose GHCR or ACR.
-8. Copy/adapt the sample app and Dockerfile into the target repository.
-9. If GHCR mode, add the workflow and make the resulting package public.
-10. Deploy ACA, private Blob Storage, RBAC, secrets, env vars, and optional DNS.
-11. Upload content to Blob and set Cold tier.
-12. Smoke test:
+2. Choose storage networking; default to `private-endpoint`, ask before using `public-rbac`.
+3. Confirm or generate VNet CIDR, ACA subnet, private endpoint subnet, and private DNS zone values.
+4. Choose custom DNS or ACA built-in hostname.
+5. Choose auth provider.
+6. If the hostname is known, give the user provider-specific app registration links and exact callback URLs; if using the ACA built-in hostname, bootstrap ACA first and then provide those URLs.
+7. Collect app registration values.
+8. Collect allowed users.
+9. Choose GHCR or ACR.
+10. Copy/adapt the sample app and Dockerfile into the target repository.
+11. If GHCR mode, add the workflow and make the resulting package public.
+12. Create Storage, VNet/subnets, private DNS, Blob private endpoint, and VNet-integrated ACA Workload Profiles environment.
+13. Deploy ACA, RBAC, secrets, env vars, and optional DNS.
+14. Upload content to Blob using VNet runner or temporary narrow public upload window.
+15. Lock Storage to `publicNetworkAccess=Disabled`, `defaultAction=Deny`, `bypass=None`.
+16. Smoke test:
     - unauthenticated request redirects to provider, unless `AUTH_PROVIDER=none`;
     - allowed user can load `index.html`;
     - non-allowed user gets `403`;
     - media range requests return `206 Partial Content`;
     - Blob direct anonymous access fails.
+    - `/storage-health` works only for an authenticated session and reports Storage availability.
 
 ## Day-2 task handling
 
 For "add user", update only `ALLOWED_USERS` or provider-specific allowlist env vars and restart/revise ACA.
 
-For "upload new content", regenerate local static output, run Blob sync with delete enabled only if local output is authoritative, then set Cold tier.
+For "upload new content", regenerate local static output, run Blob sync with delete enabled only if local output is authoritative, then set Cold tier. With private endpoint mode, upload from a VNet path or use the temporary narrow public upload window and always restore locked Storage state in `finally`.
 
 Prefer AzCopy for large sites or many files. If AzCopy is unavailable and the site is small, Azure CLI `az storage blob upload-batch --auth-mode login` is an acceptable fallback; for large sites, install AzCopy first or use the deploy script with `-InstallAzCopy`.
 

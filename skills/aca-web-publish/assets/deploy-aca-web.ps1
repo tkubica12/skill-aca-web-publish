@@ -29,7 +29,17 @@ param(
     [string]$UploadMode = "auto",
     [switch]$InstallAzCopy,
     [switch]$BootstrapOnly,
-    [switch]$SkipStorageNetworkPolicyExemption
+    [ValidateSet("private-endpoint", "public-rbac")]
+    [string]$StorageNetworkMode = "private-endpoint",
+    [string]$VnetName = "",
+    [string]$VnetAddressPrefix = "10.42.0.0/24",
+    [string]$AcaSubnetName = "snet-aca-env",
+    [string]$AcaSubnetPrefix = "10.42.0.0/27",
+    [string]$PrivateEndpointSubnetName = "snet-storage-pe",
+    [string]$PrivateEndpointSubnetPrefix = "10.42.0.32/28",
+    [string]$PrivateDnsZoneName = "privatelink.blob.core.windows.net",
+    [bool]$TemporaryPublicUpload = $true,
+    [string]$UploaderIpAddress = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -63,6 +73,83 @@ function Install-AzCopyIfRequested {
     return Get-Command azcopy -ErrorAction Stop
 }
 
+function Invoke-ContentUpload {
+    param(
+        [string]$AccountName,
+        [string]$Container,
+        [string]$SourceDir
+    )
+
+    $azCopy = Get-Command azcopy -ErrorAction SilentlyContinue
+    if (-not $azCopy) {
+        $azCopy = Install-AzCopyIfRequested
+    }
+    if ($UploadMode -eq "azcopy" -and -not $azCopy) {
+        throw "AzCopy is required when UploadMode=azcopy. Install AzCopy or pass -InstallAzCopy."
+    }
+    if ($UploadMode -ne "cli" -and $azCopy) {
+        azcopy sync $SourceDir "https://$AccountName.blob.core.windows.net/$Container" --recursive=true --delete-destination=true
+        azcopy set-properties "https://$AccountName.blob.core.windows.net/$Container" --block-blob-tier=Cold --recursive=true
+    } else {
+        Write-Warning "AzCopy is not available; using Azure CLI upload fallback. Prefer AzCopy for large sites or many files."
+        az storage blob delete-batch --account-name $AccountName --source $Container --auth-mode login --output none
+        az storage blob upload-batch --account-name $AccountName --destination $Container --source $SourceDir --auth-mode login --overwrite true --tier Cold --output none
+    }
+}
+
+function Invoke-TemporaryPublicUpload {
+    param(
+        [string]$AccountName,
+        [string]$StorageResourceGroup,
+        [string]$Container,
+        [string]$SourceDir
+    )
+
+    if (-not $TemporaryPublicUpload) {
+        throw "Local upload requires public network reachability or a VNet-hosted runner when StorageNetworkMode=private-endpoint."
+    }
+    $ip = $UploaderIpAddress
+    if (-not $ip) {
+        $ip = (Invoke-RestMethod "https://api.ipify.org").Trim()
+    }
+
+    try {
+        az storage account update `
+            --name $AccountName `
+            --resource-group $StorageResourceGroup `
+            --public-network-access Enabled `
+            --default-action Deny `
+            --bypass None `
+            --allow-blob-public-access false `
+            --allow-shared-key-access false `
+            --output none
+
+        az storage account network-rule add `
+            --account-name $AccountName `
+            --resource-group $StorageResourceGroup `
+            --ip-address $ip `
+            --output none
+
+        Invoke-ContentUpload -AccountName $AccountName -Container $Container -SourceDir $SourceDir
+    } finally {
+        az storage account network-rule remove `
+            --account-name $AccountName `
+            --resource-group $StorageResourceGroup `
+            --ip-address $ip `
+            --output none 2>$null
+
+        az storage account update `
+            --name $AccountName `
+            --resource-group $StorageResourceGroup `
+            --public-network-access Disabled `
+            --default-action Deny `
+            --bypass None `
+            --allow-blob-public-access false `
+            --allow-shared-key-access false `
+            --output none
+    }
+}
+
 if (-not $ResourceGroup -or -not $AppName -or -not $EnvironmentName -or -not $StorageAccountName -or -not $ContentDir) {
     throw "ResourceGroup, AppName, EnvironmentName, StorageAccountName, and ContentDir are required."
 }
@@ -83,6 +170,9 @@ if (-not $SessionSecret) {
     [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
     $SessionSecret = [Convert]::ToBase64String($bytes)
 }
+if (-not $VnetName) {
+    $VnetName = "$AppName-vnet"
+}
 
 az group create --name $ResourceGroup --location $Location --output none
 
@@ -95,6 +185,8 @@ az storage account create `
     --allow-blob-public-access false `
     --allow-shared-key-access false `
     --public-network-access Enabled `
+    --default-action Deny `
+    --bypass None `
     --output none 2>$null
 
 az storage account update `
@@ -103,6 +195,8 @@ az storage account update `
     --allow-blob-public-access false `
     --allow-shared-key-access false `
     --public-network-access Enabled `
+    --default-action Deny `
+    --bypass None `
     --output none
 
 az storage container-rm create `
@@ -114,25 +208,73 @@ az storage container-rm create `
 
 $storageId = az storage account show --name $StorageAccountName --resource-group $ResourceGroup --query id -o tsv
 
-if (-not $SkipStorageNetworkPolicyExemption) {
-    $subscriptionId = az account show --query id -o tsv
-    $securityCenterAssignment = "/subscriptions/$subscriptionId/providers/Microsoft.Authorization/policyAssignments/SecurityCenterBuiltIn"
-    az policy exemption show --name "aca-web-proxy-storage-network" --scope $storageId --output none 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        az policy exemption create `
-            --name "aca-web-proxy-storage-network" `
-            --scope $storageId `
-            --policy-assignment $securityCenterAssignment `
-            --exemption-category Waiver `
-            --display-name "ACA web proxy storage network exception" `
-            --description "Private content is served only through ACA app-level auth proxy. Blob public access and shared keys are disabled; ACA managed identity uses Storage Blob Data Reader. Public network access is required unless ACA is moved to VNet private endpoint." `
-            --policy-definition-reference-ids `
-                "storageAccountsShouldRestrictNetworkAccessUsingVirtualNetworkRulesMonitoringEffect" `
-                "storageAccountsShouldRestrictNetworkAccessUsingVirtualNetworkRulesExDataBricksMonitoringEffect" `
-                "storageAccountShouldUseAPrivateLinkConnectionMonitoringEffect" `
-                "storageAccountShouldUseAPrivateLinkConnectionExDataBricksMonitoringEffect" `
-            --output none
-    }
+if ($StorageNetworkMode -eq "private-endpoint") {
+    az network vnet create `
+        --resource-group $ResourceGroup `
+        --location $Location `
+        --name $VnetName `
+        --address-prefixes $VnetAddressPrefix `
+        --subnet-name $AcaSubnetName `
+        --subnet-prefixes $AcaSubnetPrefix `
+        --output none 2>$null
+
+    az network vnet subnet update `
+        --resource-group $ResourceGroup `
+        --vnet-name $VnetName `
+        --name $AcaSubnetName `
+        --delegations Microsoft.App/environments `
+        --output none
+
+    az network vnet subnet create `
+        --resource-group $ResourceGroup `
+        --vnet-name $VnetName `
+        --name $PrivateEndpointSubnetName `
+        --address-prefixes $PrivateEndpointSubnetPrefix `
+        --output none 2>$null
+
+    az network vnet subnet update `
+        --resource-group $ResourceGroup `
+        --vnet-name $VnetName `
+        --name $PrivateEndpointSubnetName `
+        --disable-private-endpoint-network-policies true `
+        --output none
+
+    az network private-dns zone create `
+        --resource-group $ResourceGroup `
+        --name $PrivateDnsZoneName `
+        --output none 2>$null
+
+    $vnetId = az network vnet show --resource-group $ResourceGroup --name $VnetName --query id -o tsv
+    $acaSubnetId = az network vnet subnet show --resource-group $ResourceGroup --vnet-name $VnetName --name $AcaSubnetName --query id -o tsv
+    $zoneId = az network private-dns zone show --resource-group $ResourceGroup --name $PrivateDnsZoneName --query id -o tsv
+
+    az network private-dns link vnet create `
+        --resource-group $ResourceGroup `
+        --zone-name $PrivateDnsZoneName `
+        --name "$VnetName-link" `
+        --virtual-network $vnetId `
+        --registration-enabled false `
+        --output none 2>$null
+
+    $privateEndpointName = "pe-$StorageAccountName-blob"
+    az network private-endpoint create `
+        --resource-group $ResourceGroup `
+        --location $Location `
+        --name $privateEndpointName `
+        --vnet-name $VnetName `
+        --subnet $PrivateEndpointSubnetName `
+        --private-connection-resource-id $storageId `
+        --group-id blob `
+        --connection-name "$privateEndpointName-conn" `
+        --output none 2>$null
+
+    az network private-endpoint dns-zone-group create `
+        --resource-group $ResourceGroup `
+        --endpoint-name $privateEndpointName `
+        --name "zg-blob" `
+        --private-dns-zone $zoneId `
+        --zone-name $PrivateDnsZoneName `
+        --output none 2>$null
 }
 
 if ($RegistryMode -eq "acr") {
@@ -148,7 +290,17 @@ if ($RegistryMode -eq "acr") {
     throw "Image is required when RegistryMode=ghcr. Use a public GHCR image such as ghcr.io/owner/repo/aca-web-proxy:latest."
 }
 
-az containerapp env create --name $EnvironmentName --resource-group $ResourceGroup --location $Location --output none 2>$null
+if ($StorageNetworkMode -eq "private-endpoint") {
+    az containerapp env create `
+        --name $EnvironmentName `
+        --resource-group $ResourceGroup `
+        --location $Location `
+        --enable-workload-profiles true `
+        --infrastructure-subnet-resource-id $acaSubnetId `
+        --output none 2>$null
+} else {
+    az containerapp env create --name $EnvironmentName --resource-group $ResourceGroup --location $Location --output none 2>$null
+}
 
 $initialImage = if ($registryId) { "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest" } else { $Image }
 $initialTargetPort = if ($registryId) { 80 } else { 8000 }
@@ -221,6 +373,23 @@ if ($registryId) {
     az containerapp update --name $AppName --resource-group $ResourceGroup --image $Image --output none
 }
 
+$signedInUserObjectId = az ad signed-in-user show --query id -o tsv
+az role assignment create --assignee $signedInUserObjectId --role "Storage Blob Data Contributor" --scope $storageId --output none 2>$null
+
+if ($StorageNetworkMode -eq "private-endpoint") {
+    Invoke-TemporaryPublicUpload -AccountName $StorageAccountName -StorageResourceGroup $ResourceGroup -Container $ContainerName -SourceDir $ContentDir
+} else {
+    az storage account update `
+        --name $StorageAccountName `
+        --resource-group $ResourceGroup `
+        --public-network-access Enabled `
+        --default-action Allow `
+        --allow-blob-public-access false `
+        --allow-shared-key-access false `
+        --output none
+    Invoke-ContentUpload -AccountName $StorageAccountName -Container $ContainerName -SourceDir $ContentDir
+}
+
 if ($CustomHostname) {
     if (-not $DnsZoneName -or -not $DnsZoneResourceGroup) {
         throw "DnsZoneName and DnsZoneResourceGroup are required with CustomHostname."
@@ -234,23 +403,16 @@ if ($CustomHostname) {
     az containerapp hostname bind --name $AppName --resource-group $ResourceGroup --hostname $CustomHostname --environment $EnvironmentName --validation-method CNAME --output none
 }
 
-$signedInUserObjectId = az ad signed-in-user show --query id -o tsv
-az role assignment create --assignee $signedInUserObjectId --role "Storage Blob Data Contributor" --scope $storageId --output none 2>$null
-
-$azCopy = Get-Command azcopy -ErrorAction SilentlyContinue
-if (-not $azCopy) {
-    $azCopy = Install-AzCopyIfRequested
-}
-if ($UploadMode -eq "azcopy" -and -not $azCopy) {
-    throw "AzCopy is required when UploadMode=azcopy. Install AzCopy or pass -InstallAzCopy."
-}
-if ($UploadMode -ne "cli" -and $azCopy) {
-    azcopy sync $ContentDir "https://$StorageAccountName.blob.core.windows.net/$ContainerName" --recursive=true --delete-destination=true
-    azcopy set-properties "https://$StorageAccountName.blob.core.windows.net/$ContainerName" --block-blob-tier=Cold --recursive=true
-} else {
-    Write-Warning "AzCopy is not available; using Azure CLI upload fallback. Prefer AzCopy for large sites or many files."
-    az storage blob delete-batch --account-name $StorageAccountName --source $ContainerName --auth-mode login --output none
-    az storage blob upload-batch --account-name $StorageAccountName --destination $ContainerName --source $ContentDir --auth-mode login --overwrite true --tier Cold --output none
+if ($StorageNetworkMode -eq "private-endpoint") {
+    az storage account update `
+        --name $StorageAccountName `
+        --resource-group $ResourceGroup `
+        --public-network-access Disabled `
+        --default-action Deny `
+        --bypass None `
+        --allow-blob-public-access false `
+        --allow-shared-key-access false `
+        --output none
 }
 
 Write-Host "DONE"

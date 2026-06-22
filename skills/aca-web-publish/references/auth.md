@@ -48,6 +48,8 @@ az containerapp show --name <app> --resource-group <rg> --query properties.confi
 
 Then use `https://<fqdn>` as the homepage/origin and `https://<fqdn>/oauth/<provider>/callback` as the callback URL.
 
+For migrations to a new VNet-integrated ACA environment, do not assume the old Container App can provide secrets. ACA secrets are write-only. Ask the user to provide the OAuth secret again, or use Key Vault references so the replacement app can reuse secrets safely.
+
 ## GitHub registration
 
 Create a GitHub OAuth App manually in GitHub Developer settings:
@@ -116,3 +118,7 @@ Authorize using object IDs where possible. UPN/email can be allowed for convenie
 ## No auth
 
 Use `AUTH_PROVIDER=none` only when the user explicitly requests no authentication. Blob Storage should still remain private; ACA becomes the public serving endpoint.
+
+## OAuth/session behavior
+
+The proxy app should restart login rather than fail with a raw 500 for invalid OAuth state, expired/reused callback codes, GitHub `bad_verification_code`, and provider profile lookup `401` or `403` responses. Invalid or expired local session cookies should be cleared while redirecting the user to a fresh login.

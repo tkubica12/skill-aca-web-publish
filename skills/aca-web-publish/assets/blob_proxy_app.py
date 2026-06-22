@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 from collections.abc import Iterator
 import hashlib
 import hmac
@@ -14,12 +15,14 @@ import time
 from typing import Any
 from urllib.parse import urlencode
 from urllib.parse import unquote
+from urllib.parse import urlparse
 
+from azure.core.exceptions import HttpResponseError
 from azure.core.exceptions import ResourceNotFoundError
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient, ContainerClient
 from fastapi import FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 import httpx
 
 app = FastAPI(title="ACA private Blob proxy")
@@ -28,6 +31,10 @@ _CHUNK_SIZE = 1024 * 1024
 _SESSION_COOKIE = "aca_web_session"
 _STATE_COOKIE = "aca_web_oauth_state"
 _SESSION_TTL_SECONDS = 60 * 60 * 24 * 14
+
+
+class RestartLoginError(Exception):
+    """Signal that the OAuth flow should restart rather than surface an error."""
 
 
 def _csv_env(name: str) -> set[str]:
@@ -45,6 +52,20 @@ def _public_base_url(request: Request) -> str:
 def _public_request_url(request: Request) -> str:
     url = f"{_public_base_url(request)}{request.url.path}"
     return f"{url}?{request.url.query}" if request.url.query else url
+
+
+def _safe_return_to(request: Request, return_to: str | None) -> str:
+    base_url = _public_base_url(request)
+    if not return_to:
+        return f"{base_url}/"
+    base = urlparse(base_url)
+    parsed = urlparse(return_to)
+    if parsed.scheme or parsed.netloc:
+        if parsed.scheme == base.scheme and parsed.netloc == base.netloc:
+            return return_to
+        return f"{base_url}/"
+    path = return_to if return_to.startswith("/") else f"/{return_to}"
+    return f"{base_url}{path}"
 
 
 def _required_env(name: str) -> str:
@@ -84,9 +105,17 @@ def _decode_signed_payload(value: str | None) -> dict[str, Any] | None:
         return None
     try:
         payload = json.loads(_b64url_decode(body))
-    except (ValueError, json.JSONDecodeError):
+    except (binascii.Error, ValueError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _is_expired(payload: dict[str, Any]) -> bool:
+    try:
+        exp = int(payload.get("exp", 0))
+    except (TypeError, ValueError):
+        return True
+    return exp < int(time.time())
 
 
 def _allowed_users() -> set[str]:
@@ -105,7 +134,7 @@ def _valid_session(request: Request) -> bool:
     if _auth_provider() == "none":
         return True
     session = _decode_signed_payload(request.cookies.get(_SESSION_COOKIE))
-    if not session or int(session.get("exp", 0)) < int(time.time()):
+    if not session or _is_expired(session):
         return False
     return str(session.get("provider", "")).casefold() == _auth_provider() and str(session.get("sub", "")).casefold() in _allowed_users()
 
@@ -114,10 +143,10 @@ def _state_cookie(return_to: str, state: str) -> str:
     return _encode_signed_payload({"state": state, "return_to": return_to, "exp": int(time.time()) + 600})
 
 
-def _start_oauth(request: Request) -> RedirectResponse:
+def _start_oauth(request: Request, return_to: str | None = None, clear_session: bool = False) -> RedirectResponse:
     provider = _auth_provider()
     if provider == "none":
-        return RedirectResponse(str(request.url), status_code=302)
+        return RedirectResponse(_safe_return_to(request, return_to), status_code=302)
     state = secrets.token_urlsafe(32)
     base_url = _public_base_url(request)
     if provider == "github":
@@ -150,24 +179,36 @@ def _start_oauth(request: Request) -> RedirectResponse:
     else:
         raise HTTPException(status_code=500, detail=f"Unsupported AUTH_PROVIDER: {provider}")
     response = RedirectResponse(location, status_code=302)
-    response.set_cookie(_STATE_COOKIE, _state_cookie(_public_request_url(request), state), httponly=True, secure=True, samesite="lax", max_age=600)
+    response.set_cookie(_STATE_COOKIE, _state_cookie(_safe_return_to(request, return_to), state), httponly=True, secure=True, samesite="lax", max_age=600)
+    if clear_session:
+        response.delete_cookie(_SESSION_COOKIE)
     return response
 
 
 def _verify_state(request: Request, state: str) -> str:
     payload = _decode_signed_payload(request.cookies.get(_STATE_COOKIE))
-    if not payload or int(payload.get("exp", 0)) < int(time.time()) or not hmac.compare_digest(str(payload.get("state", "")), state):
-        raise HTTPException(status_code=401, detail="Invalid OAuth state")
+    if not payload or _is_expired(payload) or not hmac.compare_digest(str(payload.get("state", "")), state):
+        raise RestartLoginError
     return str(payload.get("return_to") or "/")
 
 
 def _exchange_token(url: str, data: dict[str, str]) -> dict[str, Any]:
     with httpx.Client(timeout=20.0) as client:
         response = client.post(url, data=data, headers={"Accept": "application/json"})
-        response.raise_for_status()
+        if response.status_code == 400:
+            try:
+                error_payload = response.json()
+            except json.JSONDecodeError:
+                error_payload = {}
+            if isinstance(error_payload, dict) and error_payload.get("error") == "bad_verification_code":
+                raise RestartLoginError
+        if response.status_code >= 500:
+            raise HTTPException(status_code=502, detail="OAuth provider is temporarily unavailable")
+        if response.status_code >= 400:
+            raise RestartLoginError
         payload = response.json()
     if not isinstance(payload, dict) or not payload.get("access_token"):
-        raise HTTPException(status_code=401, detail="OAuth provider did not return an access token")
+        raise HTTPException(status_code=502, detail="OAuth provider did not return an access token")
     return payload
 
 
@@ -179,9 +220,13 @@ def _github_subject(access_token: str) -> str:
     }
     with httpx.Client(timeout=20.0) as client:
         user_response = client.get("https://api.github.com/user", headers=headers)
+        if user_response.status_code in {401, 403}:
+            raise RestartLoginError
         user_response.raise_for_status()
         user = user_response.json()
         emails_response = client.get("https://api.github.com/user/emails", headers=headers)
+        if emails_response.status_code in {401, 403}:
+            raise RestartLoginError
         emails_response.raise_for_status()
         emails = emails_response.json()
     login = str(user.get("login", "")).strip().casefold()
@@ -200,6 +245,8 @@ def _github_subject(access_token: str) -> str:
 def _userinfo_subject(url: str, access_token: str) -> str:
     with httpx.Client(timeout=20.0) as client:
         response = client.get(url, headers={"Authorization": f"Bearer {access_token}"})
+        if response.status_code in {401, 403}:
+            raise RestartLoginError
         response.raise_for_status()
         user = response.json()
     return str(user.get("email") or user.get("userPrincipalName") or user.get("id") or user.get("sub") or "").strip().casefold()
@@ -209,7 +256,7 @@ def _complete_login(provider: str, request: Request, code: str, state: str) -> R
     return_to = _verify_state(request, state)
     base_url = _public_base_url(request)
     if not code:
-        raise HTTPException(status_code=401, detail="Missing OAuth code")
+        raise RestartLoginError
     if provider == "github":
         token = _exchange_token("https://github.com/login/oauth/access_token", {
             "client_id": _required_env("GITHUB_CLIENT_ID"),
@@ -305,21 +352,41 @@ def _blob_chunks(container: ContainerClient, blob_name: str, offset: int, length
     yield from stream.chunks()
 
 
+def _storage_unavailable_response(error: HttpResponseError) -> HTMLResponse:
+    error_code = getattr(error, "error_code", None) or "storage_unavailable"
+    return HTMLResponse(
+        f"""<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Storage unavailable</title></head>
+<body style="font-family:system-ui,sans-serif;margin:3rem;line-height:1.5">
+  <h1>Storage is not ready yet</h1>
+  <p>The site is running, but private Blob Storage is temporarily unavailable.</p>
+  <p><strong>Error:</strong> {error_code}</p>
+  <p>Please refresh in a moment.</p>
+</body>
+</html>""",
+        status_code=503,
+    )
+
+
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.get("/login")
-def login(request: Request) -> RedirectResponse:
-    return _start_oauth(request)
+def login(request: Request, return_to: str = "") -> RedirectResponse:
+    return _start_oauth(request, return_to=return_to or None, clear_session=True)
 
 
 @app.get("/oauth/{provider}/callback")
 def oauth_callback(provider: str, request: Request, code: str = "", state: str = "") -> Response:
     if provider.casefold() != _auth_provider():
         raise HTTPException(status_code=400, detail="Unexpected OAuth provider")
-    return _complete_login(provider.casefold(), request, code, state)
+    try:
+        return _complete_login(provider.casefold(), request, code, state)
+    except RestartLoginError:
+        return _start_oauth(request, return_to=f"{_public_base_url(request)}/", clear_session=True)
 
 
 @app.get("/logout")
@@ -330,10 +397,22 @@ def logout() -> PlainTextResponse:
     return response
 
 
+@app.get("/storage-health")
+def storage_health(request: Request) -> Response:
+    if not _valid_session(request):
+        return _start_oauth(request, return_to=_public_request_url(request), clear_session=True)
+    try:
+        properties = _container_client().get_blob_client("index.html").get_blob_properties()
+    except HttpResponseError as error:
+        error_code = getattr(error, "error_code", None) or "storage_unavailable"
+        return PlainTextResponse(f"storage unavailable: {error_code}", status_code=503)
+    return PlainTextResponse(f"ok index.html {int(properties.size)}")
+
+
 @app.api_route("/{path:path}", methods=["GET", "HEAD"])
 def serve_blob(request: Request, path: str, range_header: str | None = Header(default=None, alias="Range")):
     if not _valid_session(request):
-        return _start_oauth(request)
+        return _start_oauth(request, return_to=_public_request_url(request), clear_session=True)
     blob_name = _blob_name_from_path(path)
     container = _container_client()
     blob = container.get_blob_client(blob_name)
@@ -343,6 +422,8 @@ def serve_blob(request: Request, path: str, range_header: str | None = Header(de
         if "." not in blob_name.rsplit("/", maxsplit=1)[-1]:
             return serve_blob(request, f"{blob_name}/", range_header)
         raise HTTPException(status_code=404, detail="Not found") from error
+    except HttpResponseError as error:
+        return _storage_unavailable_response(error)
     size = int(properties.size)
     content_type = _content_type(blob_name, properties.content_settings.content_type)
     selected_range = _parse_range(range_header, size)
